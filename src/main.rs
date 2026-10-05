@@ -13,7 +13,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use config::Config;
 use console::style;
-use dialoguer::{Input, Password};
+use dialoguer::Password;
 use error::Result;
 use indicatif::ProgressBar;
 use tracing_subscriber::EnvFilter;
@@ -140,9 +140,9 @@ async fn cmd_init(
 
     let ct0 = match arg_ct0 {
         Some(v) => v,
-        None => Input::new()
+        None => Password::new()
             .with_prompt("ct0")
-            .interact_text()
+            .interact()
             .map_err(|e| error::AngelicAngelError::Config(format!("input error: {}", e)))?,
     };
 
