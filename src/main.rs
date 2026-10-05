@@ -5,6 +5,7 @@ mod error;
 mod listener;
 mod push;
 mod twitter;
+mod webhook;
 
 use std::path::PathBuf;
 
@@ -37,6 +38,7 @@ async fn main() {
             Commands::Listen => cmd_listen(&config_path).await,
             Commands::Status => cmd_status(&config_path).await,
             Commands::Unregister => cmd_unregister(&config_path).await,
+            Commands::Replay => cmd_replay(&config_path).await,
         }
     };
 
@@ -107,9 +109,16 @@ async fn cmd_init(
             .map_err(|e| error::AngelicAngelError::Config(format!("input error: {}", e)))?,
     };
 
+    // Keep an existing registration so refreshing expired cookies doesn't require
+    // re-registering (the push subscription itself is still valid).
+    let registration = Config::load(config_path)
+        .ok()
+        .and_then(|c| c.registration);
+    let kept_registration = registration.is_some();
+
     let config = Config {
         twitter: config::TwitterConfig { auth_token, ct0 },
-        registration: None,
+        registration,
     };
 
     config.save(config_path)?;
@@ -118,6 +127,9 @@ async fn cmd_init(
         style("done").green().bold(),
         style(config_path.display()).underlined()
     );
+    if kept_registration {
+        eprintln!("  Existing registration kept.");
+    }
 
     Ok(())
 }
@@ -167,9 +179,11 @@ async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
         )
     })?;
 
+    let webhook_config = webhook::WebhookConfig::from_env(config_path)?;
+
     tracing::info!(config = %config_path.display(), "config loaded, starting listener");
 
-    listener::listen(registration, config_path).await?;
+    listener::listen(registration, config_path, webhook_config).await?;
 
     Ok(())
 }
@@ -182,12 +196,12 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
         Ok(config) => {
             eprintln!("{}  {}", style("Config").cyan().bold(), style(config_path.display()).dim());
             eprintln!(
-                "  auth_token  {}...",
-                style(&config.twitter.auth_token.chars().take(20).collect::<String>()).dim()
+                "  auth_token  {}",
+                style(config::mask_secret(&config.twitter.auth_token)).dim()
             );
             eprintln!(
-                "  ct0         {}...",
-                style(&config.twitter.ct0.chars().take(20).collect::<String>()).dim()
+                "  ct0         {}",
+                style(config::mask_secret(&config.twitter.ct0)).dim()
             );
 
             eprintln!();
@@ -257,5 +271,24 @@ async fn cmd_unregister(config_path: &PathBuf) -> Result<()> {
         style(config_path.display()).underlined()
     );
 
+    Ok(())
+}
+
+async fn cmd_replay(config_path: &PathBuf) -> Result<()> {
+    let webhook_config = webhook::WebhookConfig::from_env(config_path)?;
+    eprintln!(
+        "{} {}",
+        style("Replaying").bold(),
+        style(webhook_config.dead_letter_path.display()).underlined()
+    );
+
+    let (sent, failed) = spin(
+        "Sending to webhook...",
+        "Replay finished",
+        webhook::replay(&webhook_config),
+    )
+    .await?;
+
+    eprintln!("  sent {}, still failing {}", sent, failed);
     Ok(())
 }

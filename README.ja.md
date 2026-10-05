@@ -46,6 +46,9 @@ Twitter/X  ──push──▶  Mozilla AutoPush サーバ  ◀──WebSocket�
 
 ```sh
 cargo install --path .
+
+# OpenSSL の開発パッケージがない環境 (Windows など) では OpenSSL をソースからビルド
+cargo install --path . --features vendored-openssl
 ```
 
 ## 使い方
@@ -56,11 +59,12 @@ cargo install --path .
 # 対話モード
 angelic-angel init
 
-# 引数を指定する場合
-angelic-angel init --auth-token YOUR_AUTH_TOKEN --ct0 YOUR_CT0
+# 環境変数で渡す場合 (--auth-token などのフラグも使えますが、シェル履歴に残ります)
+ANGELIC_AUTH_TOKEN=... ANGELIC_CT0=... angelic-angel init
 ```
 
-Twitter の認証情報を含む `angelic-angel.toml` が作成されます。
+Twitter の認証情報を含む `angelic-angel.toml` が作成されます (Unix ではパーミッション `0600`)。
+Cookie が失効したら `init` を再実行してください。既存の登録情報は保持されます。
 
 ### 2. プッシュサブスクリプションの登録
 
@@ -78,6 +82,20 @@ WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 
 `WEBHOOK_ENDPOINT` 環境変数で、復号された通知ペイロードの HTTP POST 送信先を指定します。
 
+| 環境変数 | 説明 |
+|----------|------|
+| `WEBHOOK_ENDPOINT` | Webhook の URL (必須) |
+| `WEBHOOK_BEARER_TOKEN` | `Authorization: Bearer <token>` として送信 (任意) |
+| `WEBHOOK_MAX_ATTEMPTS` | ペイロードごとの送信試行回数 (デフォルト: 8) |
+| `WEBHOOK_DEAD_LETTER` | 送信失敗時の保存先 (デフォルト: `<設定ファイル>.failed.jsonl`) |
+
+#### Webhook への配信
+
+- 配信はバックグラウンドのキューで行うため、Webhook が遅くてもプッシュ接続は止まりません。
+- ネットワークエラー・5xx・408・429 は指数バックオフ (1秒 × 2^n、上限 60 秒。`Retry-After` があれば優先) で再試行します。それ以外の 4xx は再試行しません。
+- 再試行しても失敗したペイロードはデッドレターファイル (JSON Lines) に追記されます。`angelic-angel replay` で再送できます。
+- 自動再登録の途中で Twitter の Cookie が拒否された場合 (401/403)、無限にリトライせず `listen` を終了します。
+
 ### その他のコマンド
 
 ```sh
@@ -86,6 +104,9 @@ angelic-angel status
 
 # プッシュサブスクリプションを解除
 angelic-angel unregister
+
+# デッドレターファイルのペイロードを再送 (WEBHOOK_* 環境変数を使用)
+angelic-angel replay
 ```
 
 ### オプション

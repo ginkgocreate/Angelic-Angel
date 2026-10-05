@@ -46,6 +46,9 @@ Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket─�
 
 ```sh
 cargo install --path .
+
+# On hosts without OpenSSL development packages (e.g. Windows), build OpenSSL from source:
+cargo install --path . --features vendored-openssl
 ```
 
 ## Usage
@@ -56,11 +59,12 @@ cargo install --path .
 # Interactive mode
 angelic-angel init
 
-# Or with arguments
-angelic-angel init --auth-token YOUR_AUTH_TOKEN --ct0 YOUR_CT0
+# Or via environment variables (flags like --auth-token also work, but end up in shell history)
+ANGELIC_AUTH_TOKEN=... ANGELIC_CT0=... angelic-angel init
 ```
 
-This creates `angelic-angel.toml` with your Twitter credentials.
+This creates `angelic-angel.toml` with your Twitter credentials (mode `0600` on Unix).
+When the cookies expire, run `init` again: the existing registration is kept.
 
 ### 2. Register push subscription
 
@@ -78,6 +82,20 @@ WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 
 The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notification payloads are sent via HTTP POST.
 
+| Variable | Description |
+|----------|-------------|
+| `WEBHOOK_ENDPOINT` | Webhook URL (required) |
+| `WEBHOOK_BEARER_TOKEN` | Sent as `Authorization: Bearer <token>` (optional) |
+| `WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per payload (default: 8) |
+| `WEBHOOK_DEAD_LETTER` | Dead-letter file (default: `<config>.failed.jsonl`) |
+
+#### Webhook delivery
+
+- Deliveries run in a background queue, so a slow webhook never stalls the push connection.
+- Network errors, 5xx, 408 and 429 are retried with exponential backoff (1s × 2^n, capped at 60s; `Retry-After` is honored). Other 4xx responses are not retried.
+- Payloads that still fail are appended to the dead-letter file (JSON Lines). Re-send them with `angelic-angel replay`.
+- If the Twitter cookies are rejected (401/403) during automatic re-registration, `listen` exits instead of retrying forever.
+
 ### Other commands
 
 ```sh
@@ -86,6 +104,9 @@ angelic-angel status
 
 # Remove push subscription
 angelic-angel unregister
+
+# Re-send payloads from the dead-letter file (uses the same WEBHOOK_* variables)
+angelic-angel replay
 ```
 
 ### Options
