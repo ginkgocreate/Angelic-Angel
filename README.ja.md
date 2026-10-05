@@ -64,7 +64,7 @@ ANGELIC_AUTH_TOKEN=... ANGELIC_CT0=... angelic-angel init
 ```
 
 Twitter の認証情報を含む `angelic-angel.toml` が作成されます (Unix ではパーミッション `0600`)。
-Cookie が失効したら `init` を再実行してください。既存の登録情報は保持されます。
+Cookie が失効したら `init` と `register` を再実行してください (同じセッションのままだと確実な場合は `init --keep-registration` で既存の登録を残せます)。
 
 ### 2. プッシュサブスクリプションの登録
 
@@ -93,7 +93,8 @@ WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
 
 - 配信はバックグラウンドのキューで行うため、Webhook が遅くてもプッシュ接続は止まりません。
 - ネットワークエラー・5xx・408・429 は指数バックオフ (1秒 × 2^n、上限 60 秒。`Retry-After` があれば優先) で再試行します。それ以外の 4xx は再試行しません。
-- 再試行しても失敗したペイロードはデッドレターファイル (JSON Lines) に追記されます。`angelic-angel replay` で再送できます。
+- 再試行しても失敗したペイロードはデッドレターファイル (JSON Lines) に追記されます。`angelic-angel replay` で再送できます (`listen` の実行中でも可)。
+- 通知はキューに入った時点で AutoPush に ACK します。Ctrl-C / SIGTERM で停止すると最大 5 秒は配信を続け、残りはデッドレターファイルに書き出します。キュー内の通知が失われるのは強制終了 (SIGKILL・電源断) のときだけです。
 - 自動再登録の途中で Twitter の Cookie が拒否された場合 (401/403)、無限にリトライせず `listen` を終了します。
 
 ### その他のコマンド

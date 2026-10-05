@@ -32,3 +32,6 @@ openssl = { version = "0.10", optional = true, features = ["vendored"] }
 
 [features]
 vendored-openssl = ["dep:openssl"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

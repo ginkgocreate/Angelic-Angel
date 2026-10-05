@@ -61,9 +61,7 @@ impl AngelicAngelError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            AngelicAngelError::TwitterAuth(_)
-                | AngelicAngelError::Reregistration(_)
-                | AngelicAngelError::Config(_)
+            AngelicAngelError::TwitterAuth(_) | AngelicAngelError::Reregistration(_)
         )
     }
 }

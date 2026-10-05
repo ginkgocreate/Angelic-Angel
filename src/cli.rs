@@ -32,6 +32,10 @@ pub enum Commands {
         /// Twitter ct0 (CSRF token)
         #[arg(long, env = "ANGELIC_CT0", hide_env_values = true)]
         ct0: Option<String>,
+        /// Keep the existing push registration (only when refreshing cookies of the
+        /// same, still logged-in account; otherwise run `register` afterwards)
+        #[arg(long)]
+        keep_registration: bool,
     },
     /// Register AutoPush subscription and Twitter Push endpoint
     Register,

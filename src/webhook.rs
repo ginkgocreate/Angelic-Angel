@@ -4,6 +4,10 @@
 //! queue, so a slow or failing webhook never blocks the WebSocket (which must keep
 //! answering pings). Payloads that still fail after all retries are appended to a
 //! JSON Lines dead-letter file and can be re-sent later with `angelic-angel replay`.
+//!
+//! Notifications are ACKed to AutoPush once queued, so on shutdown the worker writes
+//! whatever is still queued (and the in-flight payload) to the dead-letter file.
+//! Only a hard kill (SIGKILL, power loss) can lose queued payloads.
 
 use crate::error::{AngelicAngelError, Result};
 use reqwest::{Client, StatusCode};
@@ -11,7 +15,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Maximum payloads waiting for delivery before new ones go straight to the dead-letter file.
@@ -20,6 +24,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 const RETRY_BASE_MS: u64 = 1000;
 const RETRY_CAP_MS: u64 = 60_000;
+/// On shutdown, how long the worker may keep delivering normally before the rest of
+/// the queue is written to the dead-letter file.
+const SHUTDOWN_GRACE_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct WebhookConfig {
@@ -67,8 +74,12 @@ impl WebhookConfig {
 }
 
 pub fn default_dead_letter_path(config_path: &Path) -> PathBuf {
-    let mut p = config_path.as_os_str().to_owned();
-    p.push(".failed.jsonl");
+    with_suffix(config_path, ".failed.jsonl")
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
     PathBuf::from(p)
 }
 
@@ -96,31 +107,104 @@ impl WebhookSender {
     }
 }
 
-/// Starts the delivery worker. It runs until every `WebhookSender` is dropped and the
-/// queue has drained.
-pub fn spawn(config: WebhookConfig) -> Result<(WebhookSender, JoinHandle<()>)> {
+/// The background delivery task.
+pub struct WebhookWorker {
+    handle: JoinHandle<()>,
+    stop: watch::Sender<bool>,
+}
+
+impl WebhookWorker {
+    /// Waits until every `WebhookSender` is dropped and the queue has been delivered
+    /// (or dead-lettered after retries).
+    #[allow(dead_code)]
+    pub async fn finish(self) {
+        let WebhookWorker { handle, stop } = self;
+        let _ = handle.await;
+        drop(stop);
+    }
+
+    /// Shuts the worker down after the senders are dropped: delivery continues for a
+    /// short grace period, then the in-flight payload and the rest of the queue are
+    /// written to the dead-letter file without further retries.
+    pub async fn shutdown(self) {
+        let WebhookWorker { mut handle, stop } = self;
+        if tokio::time::timeout(Duration::from_secs(SHUTDOWN_GRACE_SECS), &mut handle)
+            .await
+            .is_err()
+        {
+            let _ = stop.send(true);
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Resolves once a stop has been requested (never, if the worker handle was dropped).
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|s| *s).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Starts the delivery worker.
+pub fn spawn(config: WebhookConfig) -> Result<(WebhookSender, WebhookWorker)> {
     let client = build_client()?;
     let (tx, mut rx) = mpsc::channel::<Value>(QUEUE_CAPACITY);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let sender = WebhookSender {
         tx,
         dead_letter_path: config.dead_letter_path.clone(),
     };
 
     let handle = tokio::spawn(async move {
-        while let Some(payload) = rx.recv().await {
-            if let Err(e) = deliver_with_retry(&client, &config, &payload).await {
+        loop {
+            let payload = tokio::select! {
+                biased;
+                _ = stop_requested(&mut stop_rx) => break,
+                p = rx.recv() => match p {
+                    Some(p) => p,
+                    None => break,
+                },
+            };
+
+            let result = tokio::select! {
+                biased;
+                _ = stop_requested(&mut stop_rx) => Err(AngelicAngelError::Webhook(
+                    "shut down before delivery completed".to_string(),
+                )),
+                r = deliver_with_retry(&client, &config, &payload) => r,
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %e, path = %config.dead_letter_path.display(), "webhook delivery failed, saving to dead-letter file");
-                if let Err(e2) =
-                    append_dead_letter(&config.dead_letter_path, &payload, &e.to_string()).await
-                {
-                    // Last resort: keep the payload in the log so it's not silently lost.
-                    tracing::error!(error = %e2, payload = %payload, "failed to write dead-letter file");
-                }
+                save_dead_letter(&config.dead_letter_path, &payload, &e.to_string()).await;
             }
+        }
+
+        // Stopped: persist anything still queued.
+        rx.close();
+        while let Ok(payload) = rx.try_recv() {
+            save_dead_letter(
+                &config.dead_letter_path,
+                &payload,
+                "shut down before delivery",
+            )
+            .await;
         }
     });
 
-    Ok((sender, handle))
+    Ok((
+        sender,
+        WebhookWorker {
+            handle,
+            stop: stop_tx,
+        },
+    ))
+}
+
+async fn save_dead_letter(path: &Path, payload: &Value, error: &str) {
+    if let Err(e) = append_dead_letter(path, payload, error).await {
+        // Last resort: keep the payload in the log so it's not silently lost.
+        tracing::error!(error = %e, payload = %payload, "failed to write dead-letter file");
+    }
 }
 
 fn build_client() -> Result<Client> {
@@ -207,43 +291,81 @@ async fn append_dead_letter(path: &Path, payload: &Value, error: &str) -> Result
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut line = serde_json::to_string(&json!({
+    let line = serde_json::to_string(&json!({
         "failed_at": failed_at,
         "error": error,
         "payload": payload,
     }))?;
-    line.push('\n');
+    append_line(path, &line).await
+}
 
+async fn append_line(path: &Path, line: &str) -> Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await?;
-    file.write_all(line.as_bytes()).await?;
+    file.write_all(format!("{}\n", line).as_bytes()).await?;
     file.flush().await?;
     Ok(())
 }
 
-/// Re-sends every entry in the dead-letter file. Entries that fail again are kept
-/// (with the new error); the rest are removed. Returns (sent, still_failed).
-pub async fn replay(config: &WebhookConfig) -> Result<(usize, usize)> {
-    let content = match tokio::fs::read_to_string(&config.dead_letter_path).await {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(e) => return Err(e.into()),
-    };
+/// Removes the replay lock file when dropped.
+struct ReplayLock(PathBuf);
 
+impl Drop for ReplayLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Re-sends every entry in the dead-letter file. Returns (sent, still_failed).
+///
+/// Safe to run while `listen` is running: the file is first moved aside to
+/// `<file>.replaying`, so new failures keep going to a fresh dead-letter file, and
+/// entries that fail again are appended back to it. A lock file prevents two replays
+/// from sending the same entries twice. If a previous replay was interrupted, its
+/// `.replaying` file is processed first (run `replay` again for the rest).
+pub async fn replay(config: &WebhookConfig) -> Result<(usize, usize)> {
+    let path = &config.dead_letter_path;
+    let lock_path = with_suffix(path, ".replay.lock");
+    let replaying = with_suffix(path, ".replaying");
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(AngelicAngelError::Config(format!(
+                "another replay is running (delete {} if it was interrupted)",
+                lock_path.display()
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let _lock = ReplayLock(lock_path);
+
+    if !replaying.exists() {
+        match tokio::fs::rename(path, &replaying).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let content = tokio::fs::read_to_string(&replaying).await?;
     let client = build_client()?;
-    let mut sent = 0;
-    let mut remaining = String::new();
+    let (mut sent, mut failed) = (0, 0);
 
     for line in content.lines().filter(|l| !l.trim().is_empty()) {
         let entry: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "skipping unreadable dead-letter line (kept)");
-                remaining.push_str(line);
-                remaining.push('\n');
+                tracing::warn!(error = %e, "keeping unreadable dead-letter line");
+                append_line(path, line).await?;
+                failed += 1;
                 continue;
             }
         };
@@ -254,19 +376,13 @@ pub async fn replay(config: &WebhookConfig) -> Result<(usize, usize)> {
             Err(e) => {
                 let mut entry = entry;
                 entry["error"] = Value::String(e.to_string());
-                remaining.push_str(&serde_json::to_string(&entry)?);
-                remaining.push('\n');
+                append_line(path, &serde_json::to_string(&entry)?).await?;
+                failed += 1;
             }
         }
     }
 
-    let failed = remaining.lines().count();
-    let mut tmp = config.dead_letter_path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    tokio::fs::write(&tmp, remaining).await?;
-    tokio::fs::rename(&tmp, &config.dead_letter_path).await?;
-
+    tokio::fs::remove_file(&replaying).await?;
     Ok((sent, failed))
 }
 
@@ -404,10 +520,10 @@ mod tests {
         let cfg = test_config(url, dead.clone(), 2);
 
         // Worker gives up after 2 attempts (both 500) and writes the dead letter.
-        let (sender, handle) = spawn(cfg.clone()).unwrap();
+        let (sender, worker) = spawn(cfg.clone()).unwrap();
         sender.enqueue(json!({"id": 1})).await.unwrap();
         drop(sender);
-        handle.await.unwrap();
+        worker.finish().await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
 
         let content = std::fs::read_to_string(&dead).unwrap();
@@ -415,9 +531,72 @@ mod tests {
         assert_eq!(entry["payload"], json!({"id": 1}));
         assert!(entry["error"].as_str().unwrap().contains("giving up"));
 
-        // Replay: the server now answers 200, so the file empties.
+        // Replay: the server now answers 200, so nothing is left.
         assert_eq!(replay(&cfg).await.unwrap(), (1, 0));
-        assert_eq!(std::fs::read_to_string(&dead).unwrap(), "");
+        assert!(!dead.exists());
+        assert!(!with_suffix(&dead, ".replaying").exists());
+        assert!(!with_suffix(&dead, ".replay.lock").exists());
+    }
+
+    #[tokio::test]
+    async fn replay_keeps_failures_and_new_entries() {
+        let dead = temp_path("replay-fail");
+        let (url, _, _) = fake_server(vec![400]).await;
+        let cfg = test_config(url, dead.clone(), 1);
+
+        append_dead_letter(&dead, &json!({"id": "old"}), "x")
+            .await
+            .unwrap();
+        // Simulates an interrupted replay that left entries behind.
+        append_line(&with_suffix(&dead, ".replaying"), "not json")
+            .await
+            .unwrap();
+
+        // The interrupted `.replaying` file is processed first; the main file is untouched.
+        assert_eq!(replay(&cfg).await.unwrap(), (0, 1));
+        let content = std::fs::read_to_string(&dead).unwrap();
+        assert!(content.contains(r#""id":"old""#));
+        assert!(content.contains("not json"));
+
+        // Next run: both entries fail again (400) and are appended back.
+        assert_eq!(replay(&cfg).await.unwrap(), (0, 2));
+        assert_eq!(std::fs::read_to_string(&dead).unwrap().lines().count(), 2);
+        std::fs::remove_file(&dead).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_is_refused() {
+        let dead = temp_path("replay-lock");
+        let lock = with_suffix(&dead, ".replay.lock");
+        std::fs::write(&lock, "").unwrap();
+        let cfg = test_config("http://127.0.0.1:1/".into(), dead, 1);
+
+        assert!(replay(&cfg).await.is_err());
+        // The lock belongs to the other replay and must not be removed.
+        assert!(lock.exists());
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_dead_letters_queued_and_in_flight_payloads() {
+        let dead = temp_path("shutdown");
+        // Always 503 with a long backoff, so payloads stay queued.
+        let (url, _, _) = fake_server(vec![503]).await;
+        let mut cfg = test_config(url, dead.clone(), 100);
+        cfg.retry_base = Duration::from_secs(30);
+
+        let (sender, worker) = spawn(cfg).unwrap();
+        for id in 0..3 {
+            sender.enqueue(json!({ "id": id })).await.unwrap();
+        }
+        drop(sender);
+        worker.shutdown().await;
+
+        let content = std::fs::read_to_string(&dead).unwrap();
+        assert_eq!(content.lines().count(), 3);
+        for id in 0..3 {
+            assert!(content.contains(&format!(r#""id":{}"#, id)));
+        }
         std::fs::remove_file(&dead).unwrap();
     }
 
@@ -433,10 +612,10 @@ mod tests {
         let dead = temp_path("unreachable");
         let cfg = test_config(format!("http://127.0.0.1:{}/", port), dead.clone(), 2);
 
-        let (sender, handle) = spawn(cfg).unwrap();
+        let (sender, worker) = spawn(cfg).unwrap();
         sender.enqueue(json!({"id": 2})).await.unwrap();
         drop(sender);
-        handle.await.unwrap();
+        worker.finish().await;
 
         assert!(
             std::fs::read_to_string(&dead)

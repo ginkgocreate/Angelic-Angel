@@ -64,7 +64,7 @@ ANGELIC_AUTH_TOKEN=... ANGELIC_CT0=... angelic-angel init
 ```
 
 This creates `angelic-angel.toml` with your Twitter credentials (mode `0600` on Unix).
-When the cookies expire, run `init` again: the existing registration is kept.
+When the cookies expire, run `init` and then `register` again (`init --keep-registration` keeps the old registration if you are sure the same session is still logged in).
 
 ### 2. Register push subscription
 
@@ -93,7 +93,8 @@ The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notificati
 
 - Deliveries run in a background queue, so a slow webhook never stalls the push connection.
 - Network errors, 5xx, 408 and 429 are retried with exponential backoff (1s × 2^n, capped at 60s; `Retry-After` is honored). Other 4xx responses are not retried.
-- Payloads that still fail are appended to the dead-letter file (JSON Lines). Re-send them with `angelic-angel replay`.
+- Payloads that still fail are appended to the dead-letter file (JSON Lines). Re-send them with `angelic-angel replay` (safe to run while `listen` is running).
+- Notifications are ACKed to AutoPush once queued. On Ctrl-C / SIGTERM, `listen` keeps delivering for up to 5 seconds, then writes the rest of the queue to the dead-letter file. Only a hard kill (SIGKILL, power loss) can lose queued payloads.
 - If the Twitter cookies are rejected (401/403) during automatic re-registration, `listen` exits instead of retrying forever.
 
 ### Other commands

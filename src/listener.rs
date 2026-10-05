@@ -3,6 +3,7 @@ use crate::config::{self, Registration};
 use crate::error::{AngelicAngelError, Result};
 use crate::twitter;
 use crate::webhook::{self, WebhookConfig, WebhookSender};
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -58,56 +59,83 @@ struct ListenState {
 /// - No upper limit on retry attempts (infinite retries), except for fatal errors.
 /// - Exponential backoff: 5s * 2^n, capped at 5 minutes.
 /// - Server-initiated backoff via close code 4774 delays reconnection for 30 minutes.
+///
+/// Returns `Ok(())` when `shutdown` resolves (Ctrl-C / SIGTERM). Either way, queued
+/// webhook payloads are flushed or written to the dead-letter file before returning.
 pub async fn listen(
     mut registration: Registration,
     config_path: &Path,
     webhook_config: WebhookConfig,
+    shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let (sender, worker) = webhook::spawn(webhook_config)?;
     let mut state = ListenState {
         retry_count: 0,
         pending_reregistration: None,
     };
+    tokio::pin!(shutdown);
 
     let result = loop {
-        match listen_once(&mut registration, config_path, &sender, &mut state).await {
-            SessionOutcome::NormalClose => {
-                state.retry_count = 0;
-                tracing::info!("WebSocket connection closed, reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+        let step = run_session(&mut registration, config_path, &sender, &mut state);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown requested");
+                break Ok(());
             }
-            SessionOutcome::DisconnectedAfterConnect(AngelicAngelError::Backoff)
-            | SessionOutcome::ConnectionFailed(AngelicAngelError::Backoff) => {
-                tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
-                tokio::time::sleep(Duration::from_secs(SERVER_BACKOFF_SECS)).await;
-            }
-            SessionOutcome::DisconnectedAfterConnect(e) => {
-                state.retry_count = 0;
-                tracing::info!(error = %e, "disconnected after connect, reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            SessionOutcome::ConnectionFailed(e) => {
-                state.retry_count += 1;
-                let delay = calc_backoff(state.retry_count);
-                tracing::warn!(
-                    retry_count = state.retry_count,
-                    delay_secs = delay,
-                    error = %e,
-                    "WebSocket connection failed, retrying"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-            }
-            SessionOutcome::Fatal(e) => {
-                tracing::error!(error = %e, "fatal error, stopping listener");
-                break Err(e);
+            stop = step => {
+                if let Some(e) = stop {
+                    break Err(e);
+                }
             }
         }
     };
 
-    // Let queued webhook deliveries finish (or reach the dead-letter file) before exiting.
     drop(sender);
-    let _ = worker.await;
+    worker.shutdown().await;
     result
+}
+
+/// Runs one session plus the reconnect delay. Returns `Some(error)` to stop listening.
+async fn run_session(
+    registration: &mut Registration,
+    config_path: &Path,
+    sender: &WebhookSender,
+    state: &mut ListenState,
+) -> Option<AngelicAngelError> {
+    match listen_once(registration, config_path, sender, state).await {
+        SessionOutcome::NormalClose => {
+            state.retry_count = 0;
+            tracing::info!("WebSocket connection closed, reconnecting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        SessionOutcome::DisconnectedAfterConnect(AngelicAngelError::Backoff)
+        | SessionOutcome::ConnectionFailed(AngelicAngelError::Backoff) => {
+            tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
+            tokio::time::sleep(Duration::from_secs(SERVER_BACKOFF_SECS)).await;
+        }
+        SessionOutcome::DisconnectedAfterConnect(e) => {
+            state.retry_count = 0;
+            tracing::info!(error = %e, "disconnected after connect, reconnecting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        SessionOutcome::ConnectionFailed(e) => {
+            state.retry_count += 1;
+            let delay = calc_backoff(state.retry_count);
+            tracing::warn!(
+                retry_count = state.retry_count,
+                delay_secs = delay,
+                error = %e,
+                "WebSocket connection failed, retrying"
+            );
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        SessionOutcome::Fatal(e) => {
+            tracing::error!(error = %e, "fatal error, stopping listener");
+            return Some(e);
+        }
+    }
+    None
 }
 
 /// Runs a single listen session: connect, receive notifications, return outcome.
@@ -138,6 +166,13 @@ async fn try_connect(
     config_path: &Path,
     state: &mut ListenState,
 ) -> Result<autopush::AutoPushClient> {
+    // Load before taking the pending re-registration so a read error can't discard it.
+    let mut preloaded_config = if state.pending_reregistration.is_some() {
+        Some(config::Config::load(config_path)?)
+    } else {
+        None
+    };
+
     let reregistration = match state.pending_reregistration.take() {
         Some(pending) => {
             tracing::info!("retrying Twitter registration for pending AutoPush subscription");
@@ -168,7 +203,16 @@ async fn try_connect(
         keys: reregistration.keys.clone(),
     };
 
-    let mut full_config = config::Config::load(config_path)?;
+    let mut full_config = match preloaded_config.take() {
+        Some(c) => c,
+        None => match config::Config::load(config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                state.pending_reregistration = Some(reregistration);
+                return Err(e);
+            }
+        },
+    };
 
     tracing::info!("re-registering with Twitter API");
     if let Err(e) = twitter::register(&full_config.twitter, &subscription).await {
@@ -391,6 +435,36 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[tokio::test]
+    async fn shutdown_stops_before_connecting() {
+        // `biased` select polls the shutdown future first, so no network access happens.
+        let keys = crate::push::generate_keys();
+        let registration = Registration {
+            endpoint: "https://example.invalid".into(),
+            autopush: config::AutoPushSession {
+                uaid: "uaid".into(),
+                channel_id: "chan".into(),
+            },
+            keys,
+        };
+        let webhook_config = WebhookConfig {
+            url: "http://127.0.0.1:1/".into(),
+            bearer_token: None,
+            dead_letter_path: std::env::temp_dir().join("aa-unused.jsonl"),
+            max_attempts: 1,
+            retry_base: Duration::from_millis(1),
+        };
+
+        let result = listen(
+            registration,
+            Path::new("unused.toml"),
+            webhook_config,
+            async {},
+        )
+        .await;
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn backoff_matches_firefox_schedule() {

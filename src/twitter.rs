@@ -84,7 +84,7 @@ fn classify_error(status: reqwest::StatusCode, body: String) -> AngelicAngelErro
     let msg = format!("push subscription registration failed ({}): {}", status, body);
     match status.as_u16() {
         401 | 403 => AngelicAngelError::TwitterAuth(format!(
-            "{} (refresh auth_token/ct0 with `angelic-angel init`)",
+            "{} (refresh auth_token/ct0 with `angelic-angel init`, then run `angelic-angel register`)",
             msg
         )),
         _ => AngelicAngelError::TwitterApi(msg),
