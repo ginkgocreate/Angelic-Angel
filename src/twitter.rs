@@ -42,8 +42,8 @@ async fn register_push_subscription(
         }
     });
 
-    tracing::debug!(url = %url, "sending push subscription request");
-    tracing::debug!(body = %serde_json::to_string_pretty(&body).unwrap(), "request body");
+    // Don't log the body: encryption_key2 is the auth secret for decrypting notifications.
+    tracing::debug!(url = %url, endpoint = %token, "sending push subscription request");
 
     let response = client
         .post(&url)
@@ -67,18 +67,40 @@ async fn register_push_subscription(
     let status = response.status();
     tracing::debug!(status = %status, "response status");
 
-    if !response.status().is_success() {
-        let error_text = response.text().await?;
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_default();
         tracing::debug!(body = %error_text, "error response body");
-
-        return Err(AngelicAngelError::TwitterApi(format!(
-            "push subscription registration failed ({}): {}",
-            status, error_text
-        )));
+        return Err(classify_error(status, error_text));
     }
 
     let response_json: serde_json::Value = response.json().await?;
     tracing::debug!(body = %serde_json::to_string_pretty(&response_json).unwrap(), "success response body");
 
     Ok(())
+}
+
+/// 401/403 mean the cookies are expired or invalid; retrying won't fix that.
+fn classify_error(status: reqwest::StatusCode, body: String) -> AngelicAngelError {
+    let msg = format!("push subscription registration failed ({}): {}", status, body);
+    match status.as_u16() {
+        401 | 403 => AngelicAngelError::TwitterAuth(format!(
+            "{} (refresh auth_token/ct0 with `angelic-angel init`, then run `angelic-angel register`)",
+            msg
+        )),
+        _ => AngelicAngelError::TwitterApi(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn auth_failures_are_fatal() {
+        assert!(classify_error(StatusCode::UNAUTHORIZED, String::new()).is_fatal());
+        assert!(classify_error(StatusCode::FORBIDDEN, String::new()).is_fatal());
+        assert!(!classify_error(StatusCode::TOO_MANY_REQUESTS, String::new()).is_fatal());
+        assert!(!classify_error(StatusCode::BAD_GATEWAY, String::new()).is_fatal());
+    }
 }

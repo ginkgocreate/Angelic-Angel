@@ -23,13 +23,19 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize config file (interactive if no arguments given)
+    ///
+    /// Prefer the environment variables over the flags: flags end up in shell history.
     Init {
         /// Twitter auth_token
-        #[arg(long)]
+        #[arg(long, env = "ANGELIC_AUTH_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
         /// Twitter ct0 (CSRF token)
-        #[arg(long)]
+        #[arg(long, env = "ANGELIC_CT0", hide_env_values = true)]
         ct0: Option<String>,
+        /// Keep the existing push registration (only when refreshing cookies of the
+        /// same, still logged-in account; otherwise run `register` afterwards)
+        #[arg(long)]
+        keep_registration: bool,
     },
     /// Register AutoPush subscription and Twitter Push endpoint
     Register,
@@ -39,4 +45,6 @@ pub enum Commands {
     Status,
     /// Unregister AutoPush subscription
     Unregister,
+    /// Re-send payloads saved in the dead-letter file after webhook failures
+    Replay,
 }

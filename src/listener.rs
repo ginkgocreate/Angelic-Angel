@@ -1,10 +1,14 @@
-use crate::autopush::{self, ConnectResult};
+use crate::autopush::{self, ConnectResult, ReregistrationInfo};
 use crate::config::{self, Registration};
-use crate::error::{Result, AngelicAngelError};
+use crate::error::{AngelicAngelError, Result};
 use crate::twitter;
-use reqwest::Client;
+use crate::webhook::{self, WebhookConfig, WebhookSender};
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
+
+/// How long to wait after the server sends close code 4774 (Firefox-compatible).
+const SERVER_BACKOFF_SECS: u64 = 30 * 60;
 
 /// Outcome of a single listen session.
 ///
@@ -19,7 +23,7 @@ enum SessionOutcome {
     DisconnectedAfterConnect(AngelicAngelError),
     /// Failed before establishing a connection (hello never completed).
     ConnectionFailed(AngelicAngelError),
-    /// Unrecoverable error (e.g. UAID invalidated and re-registration also failed).
+    /// Unrecoverable error (expired cookies, repeated UAID invalidation, broken config).
     Fatal(AngelicAngelError),
 }
 
@@ -40,154 +44,227 @@ fn calc_backoff(retry_count: u32) -> u64 {
     )
 }
 
+struct ListenState {
+    retry_count: u32,
+    /// A fresh AutoPush registration whose Twitter registration hasn't succeeded yet.
+    /// Kept across retries so a transient Twitter error doesn't create a new AutoPush
+    /// subscription on every attempt.
+    pending_reregistration: Option<ReregistrationInfo>,
+}
+
 /// Main listen loop with automatic reconnection.
 ///
 /// Reconnection strategy mirrors Firefox (PushServiceWebSocket.sys.mjs):
 /// - Reset retry counter on any successful message receipt (connection established).
-/// - No upper limit on retry attempts (infinite retries).
+/// - No upper limit on retry attempts (infinite retries), except for fatal errors.
 /// - Exponential backoff: 5s * 2^n, capped at 5 minutes.
 /// - Server-initiated backoff via close code 4774 delays reconnection for 30 minutes.
-pub async fn listen(mut registration: Registration, config_path: &Path) -> Result<()> {
-    let mut retry_count: u32 = 0;
+///
+/// Returns `Ok(())` when `shutdown` resolves (Ctrl-C / SIGTERM). Either way, queued
+/// webhook payloads are flushed or written to the dead-letter file before returning.
+pub async fn listen(
+    mut registration: Registration,
+    config_path: &Path,
+    webhook_config: WebhookConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    let (sender, worker) = webhook::spawn(webhook_config)?;
+    let mut state = ListenState {
+        retry_count: 0,
+        pending_reregistration: None,
+    };
+    tokio::pin!(shutdown);
 
-    loop {
-        match listen_once(&mut registration, config_path).await {
-            SessionOutcome::NormalClose => {
-                retry_count = 0;
-                tracing::info!("WebSocket connection closed, reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+    let result = loop {
+        let step = run_session(&mut registration, config_path, &sender, &mut state);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown requested");
+                break Ok(());
             }
-            SessionOutcome::DisconnectedAfterConnect(e) => {
-                if e.to_string().contains("BACKOFF:") {
-                    tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
-                    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-                } else {
-                    retry_count = 0;
-                    tracing::info!(error = %e, "disconnected after connect, reconnecting");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            stop = step => {
+                if let Some(e) = stop {
+                    break Err(e);
                 }
             }
-            SessionOutcome::ConnectionFailed(e) => {
-                retry_count += 1;
-                let delay = calc_backoff(retry_count);
-                tracing::warn!(
-                    retry_count,
-                    delay_secs = delay,
-                    error = %e,
-                    "WebSocket connection failed, retrying"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-            }
-            SessionOutcome::Fatal(e) => {
-                tracing::error!(error = %e, "fatal error, re-registration required");
-                return Err(e);
-            }
+        }
+    };
+
+    drop(sender);
+    worker.shutdown().await;
+    result
+}
+
+/// Runs one session plus the reconnect delay. Returns `Some(error)` to stop listening.
+async fn run_session(
+    registration: &mut Registration,
+    config_path: &Path,
+    sender: &WebhookSender,
+    state: &mut ListenState,
+) -> Option<AngelicAngelError> {
+    match listen_once(registration, config_path, sender, state).await {
+        SessionOutcome::NormalClose => {
+            state.retry_count = 0;
+            tracing::info!("WebSocket connection closed, reconnecting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        SessionOutcome::DisconnectedAfterConnect(AngelicAngelError::Backoff)
+        | SessionOutcome::ConnectionFailed(AngelicAngelError::Backoff) => {
+            tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
+            tokio::time::sleep(Duration::from_secs(SERVER_BACKOFF_SECS)).await;
+        }
+        SessionOutcome::DisconnectedAfterConnect(e) => {
+            state.retry_count = 0;
+            tracing::info!(error = %e, "disconnected after connect, reconnecting");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        SessionOutcome::ConnectionFailed(e) => {
+            state.retry_count += 1;
+            let delay = calc_backoff(state.retry_count);
+            tracing::warn!(
+                retry_count = state.retry_count,
+                delay_secs = delay,
+                error = %e,
+                "WebSocket connection failed, retrying"
+            );
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        SessionOutcome::Fatal(e) => {
+            tracing::error!(error = %e, "fatal error, stopping listener");
+            return Some(e);
         }
     }
+    None
 }
 
 /// Runs a single listen session: connect, receive notifications, return outcome.
-async fn listen_once(registration: &mut Registration, config_path: &Path) -> SessionOutcome {
-    let mut client = match try_connect(registration, config_path).await {
+async fn listen_once(
+    registration: &mut Registration,
+    config_path: &Path,
+    sender: &WebhookSender,
+    state: &mut ListenState,
+) -> SessionOutcome {
+    let mut client = match try_connect(registration, config_path, state).await {
         Ok(client) => client,
-        Err(e) => {
-            if e.to_string().contains("UAID invalid")
-                || e.to_string().contains("still failed after re-registration")
-            {
-                return SessionOutcome::Fatal(e);
-            }
-            return SessionOutcome::ConnectionFailed(e);
-        }
+        Err(e) if e.is_fatal() => return SessionOutcome::Fatal(e),
+        Err(e) => return SessionOutcome::ConnectionFailed(e),
     };
 
     tracing::info!("WebSocket connection established, listening for notifications");
 
-    match run_notification_loop(&mut client, registration).await {
+    match run_notification_loop(&mut client, registration, sender).await {
         Ok(()) => SessionOutcome::NormalClose,
+        Err(e) if e.is_fatal() => SessionOutcome::Fatal(e),
         Err(e) => SessionOutcome::DisconnectedAfterConnect(e),
     }
 }
 
 /// Establishes a connection to AutoPush, handling UAID invalidation transparently.
-async fn try_connect(registration: &mut Registration, config_path: &Path) -> Result<autopush::AutoPushClient> {
-    let connect_result =
-        autopush::connect_and_listen(&registration.autopush, &registration.keys).await?;
+async fn try_connect(
+    registration: &mut Registration,
+    config_path: &Path,
+    state: &mut ListenState,
+) -> Result<autopush::AutoPushClient> {
+    // Load before taking the pending re-registration so a read error can't discard it.
+    let mut preloaded_config = if state.pending_reregistration.is_some() {
+        Some(config::Config::load(config_path)?)
+    } else {
+        None
+    };
 
-    match connect_result {
-        ConnectResult::Connected(client) => {
-            tracing::info!("connected with existing session");
-            Ok(client)
+    let reregistration = match state.pending_reregistration.take() {
+        Some(pending) => {
+            tracing::info!("retrying Twitter registration for pending AutoPush subscription");
+            pending
         }
-        ConnectResult::NeedsReregistration(reregistration_info) => {
-            let new_reg = &reregistration_info.registration;
-            let new_keys = reregistration_info.keys;
-
-            tracing::warn!(
-                new_uaid = %new_reg.uaid,
-                new_channel_id = %new_reg.channel_id,
-                "UAID invalidated (pushsubscriptionchange), re-registering"
-            );
-
-            tracing::info!("re-registering with Twitter API");
-            let mut full_config = config::Config::load(config_path)?;
-
-            let subscription = crate::push::PushSubscription {
-                endpoint: new_reg.endpoint.clone(),
-                autopush: config::AutoPushSession {
-                    uaid: new_reg.uaid.clone(),
-                    channel_id: new_reg.channel_id.clone(),
-                },
-                keys: new_keys.clone(),
-            };
-
-            twitter::register(&full_config.twitter, &subscription).await?;
-            tracing::info!("Twitter API re-registration complete");
-
-            registration.endpoint = new_reg.endpoint.clone();
-            registration.autopush.uaid = new_reg.uaid.clone();
-            registration.autopush.channel_id = new_reg.channel_id.clone();
-            registration.keys = new_keys;
-            full_config.registration = Some(registration.clone());
-            full_config.save(config_path)?;
-            tracing::info!("saved updated registration");
-
-            match autopush::connect_and_listen(&registration.autopush, &registration.keys).await? {
-                ConnectResult::Connected(client) => Ok(client),
-                ConnectResult::NeedsReregistration(_) => Err(AngelicAngelError::AutoPush(
-                    "still failed after re-registration".to_string(),
-                )),
+        None => match autopush::connect_and_listen(&registration.autopush).await? {
+            ConnectResult::Connected(client) => {
+                tracing::info!("connected with existing session");
+                return Ok(client);
             }
+            ConnectResult::NeedsReregistration(info) => info,
+        },
+    };
+
+    let new_reg = &reregistration.registration;
+    tracing::warn!(
+        new_uaid = %new_reg.uaid,
+        new_channel_id = %new_reg.channel_id,
+        "UAID invalidated (pushsubscriptionchange), re-registering"
+    );
+
+    let subscription = crate::push::PushSubscription {
+        endpoint: new_reg.endpoint.clone(),
+        autopush: config::AutoPushSession {
+            uaid: new_reg.uaid.clone(),
+            channel_id: new_reg.channel_id.clone(),
+        },
+        keys: reregistration.keys.clone(),
+    };
+
+    let mut full_config = match preloaded_config.take() {
+        Some(c) => c,
+        None => match config::Config::load(config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                state.pending_reregistration = Some(reregistration);
+                return Err(e);
+            }
+        },
+    };
+
+    tracing::info!("re-registering with Twitter API");
+    if let Err(e) = twitter::register(&full_config.twitter, &subscription).await {
+        if !e.is_fatal() {
+            state.pending_reregistration = Some(reregistration);
         }
+        return Err(e);
+    }
+    tracing::info!("Twitter API re-registration complete");
+
+    registration.endpoint = subscription.endpoint;
+    registration.autopush = subscription.autopush;
+    registration.keys = subscription.keys;
+    full_config.registration = Some(registration.clone());
+    full_config.save(config_path)?;
+    tracing::info!("saved updated registration");
+
+    match autopush::connect_and_listen(&registration.autopush).await? {
+        ConnectResult::Connected(client) => Ok(client),
+        ConnectResult::NeedsReregistration(_) => Err(AngelicAngelError::Reregistration(
+            "UAID was invalidated again right after re-registration".to_string(),
+        )),
     }
 }
 
 /// Receives and processes notifications in a loop until the connection drops.
+///
+/// A notification is ACKed once it has been decrypted and handed to the webhook
+/// worker (or written to the dead-letter file); webhook retries happen in the background.
 async fn run_notification_loop(
     client: &mut autopush::AutoPushClient,
     registration: &Registration,
+    sender: &WebhookSender,
 ) -> Result<()> {
     while let Some(notification) = client.next_notification().await? {
-        tracing::info!(
-            channel_id = %notification.channel_id,
-            version = %notification.version,
-            "notification received"
-        );
-
-        let ack_code = if let Some(ref data) = notification.data {
-            match handle_notification_data(data, &notification.headers, &registration.keys).await {
-                Ok(()) => autopush::AckCode::Delivered,
-                Err(ref e) if is_decryption_error(e) => {
-                    tracing::warn!(error = %e, "decryption error, sending ACK with decryption_error");
-                    autopush::AckCode::DecryptionError
-                }
-                Err(ref e) => {
-                    tracing::warn!(error = %e, "notification processing error, sending ACK with not_delivered");
-                    autopush::AckCode::NotDelivered
+        let ack_code = match notification.data {
+            Some(ref data) => {
+                match decrypt_notification(data, &notification.headers, &registration.keys) {
+                    Ok(payload) => {
+                        sender.enqueue(payload).await?;
+                        autopush::AckCode::Delivered
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "decryption error, sending ACK with decryption_error");
+                        autopush::AckCode::DecryptionError
+                    }
                 }
             }
-        } else {
-            tracing::info!("empty notification (no data)");
-            autopush::AckCode::Delivered
+            None => {
+                tracing::info!("empty notification (no data)");
+                autopush::AckCode::Delivered
+            }
         };
 
         client
@@ -207,15 +284,13 @@ async fn run_notification_loop(
     Ok(())
 }
 
-fn is_decryption_error(e: &AngelicAngelError) -> bool {
-    matches!(e, AngelicAngelError::Decryption(_))
-}
-
-async fn handle_notification_data(
+/// Decrypts a notification payload and parses it as JSON (non-JSON text is wrapped
+/// as `{"raw": "..."}`).
+fn decrypt_notification(
     data: &str,
     headers: &Option<std::collections::HashMap<String, String>>,
     keys: &crate::config::WebPushKeys,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
         .map_err(|e| AngelicAngelError::Decryption(format!("base64 decode failed: {}", e)))?;
 
@@ -247,33 +322,7 @@ async fn handle_notification_data(
         serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
 
     tracing::info!(payload = %payload, "notification decrypted");
-
-    send_to_webhook(&payload).await?;
-
-    Ok(())
-}
-
-/// Sends the decrypted notification payload to the configured webhook endpoint via HTTP POST.
-async fn send_to_webhook(payload: &serde_json::Value) -> Result<()> {
-    let webhook_url = config::get_webhook_endpoint()?;
-    let client = Client::new();
-
-    tracing::info!(url = %webhook_url, "sending to webhook");
-
-    let response = client.post(&webhook_url).json(payload).send().await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("failed to read response body"));
-        tracing::warn!(status = %status, body = %error_text, "webhook request failed");
-    } else {
-        tracing::info!(status = %response.status(), "webhook request succeeded");
-    }
-
-    Ok(())
+    Ok(payload)
 }
 
 fn decrypt_ece(
@@ -379,4 +428,94 @@ fn parse_header_param(header_value: Option<&String>, param_name: &str) -> Result
         "param '{}' not found in header: {}",
         param_name, header
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[tokio::test]
+    async fn shutdown_stops_before_connecting() {
+        // `biased` select polls the shutdown future first, so no network access happens.
+        let keys = crate::push::generate_keys();
+        let registration = Registration {
+            endpoint: "https://example.invalid".into(),
+            autopush: config::AutoPushSession {
+                uaid: "uaid".into(),
+                channel_id: "chan".into(),
+            },
+            keys,
+        };
+        let webhook_config = WebhookConfig {
+            url: "http://127.0.0.1:1/".into(),
+            bearer_token: None,
+            dead_letter_path: std::env::temp_dir().join("aa-unused.jsonl"),
+            max_attempts: 1,
+            retry_base: Duration::from_millis(1),
+        };
+
+        let result = listen(
+            registration,
+            Path::new("unused.toml"),
+            webhook_config,
+            async {},
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backoff_matches_firefox_schedule() {
+        assert_eq!(calc_backoff(1), 5);
+        assert_eq!(calc_backoff(2), 10);
+        assert_eq!(calc_backoff(3), 20);
+        assert_eq!(calc_backoff(7), 300);
+        assert_eq!(calc_backoff(100), 300);
+    }
+
+    #[test]
+    fn header_param_parsing() {
+        let h = "dh=abc123;p256ecdsa=xyz".to_string();
+        assert_eq!(parse_header_param(Some(&h), "dh").unwrap(), "abc123");
+        assert_eq!(parse_header_param(Some(&h), "p256ecdsa").unwrap(), "xyz");
+        assert!(parse_header_param(Some(&h), "salt").is_err());
+        assert!(parse_header_param(None, "dh").is_err());
+    }
+
+    fn encrypt_for(keys: &crate::config::WebPushKeys, message: &[u8]) -> String {
+        let encrypted = ece::encrypt(&keys.public_key, &keys.auth_secret, message).unwrap();
+        URL_SAFE_NO_PAD.encode(encrypted)
+    }
+
+    #[test]
+    fn decrypts_aes128gcm_with_generated_keys() {
+        let keys = crate::push::generate_keys();
+        let data = encrypt_for(&keys, br#"{"title":"hello","body":"world"}"#);
+
+        let payload = decrypt_notification(&data, &None, &keys).unwrap();
+        assert_eq!(payload, serde_json::json!({"title": "hello", "body": "world"}));
+    }
+
+    #[test]
+    fn non_json_payload_is_wrapped() {
+        let keys = crate::push::generate_keys();
+        let data = encrypt_for(&keys, b"plain text");
+
+        let payload = decrypt_notification(&data, &None, &keys).unwrap();
+        assert_eq!(payload, serde_json::json!({"raw": "plain text"}));
+    }
+
+    #[test]
+    fn wrong_keys_fail_as_decryption_error() {
+        let keys = crate::push::generate_keys();
+        let other = crate::push::generate_keys();
+        let data = encrypt_for(&keys, b"secret");
+
+        assert!(matches!(
+            decrypt_notification(&data, &None, &other),
+            Err(AngelicAngelError::Decryption(_))
+        ));
+    }
 }

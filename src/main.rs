@@ -5,6 +5,7 @@ mod error;
 mod listener;
 mod push;
 mod twitter;
+mod webhook;
 
 use std::path::PathBuf;
 
@@ -12,7 +13,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use config::Config;
 use console::style;
-use dialoguer::{Input, Password};
+use dialoguer::Password;
 use error::Result;
 use indicatif::ProgressBar;
 use tracing_subscriber::EnvFilter;
@@ -30,27 +31,60 @@ async fn main() {
 
     let config_path = cli.config;
 
-    let task = async {
-        match cli.command {
-            Commands::Init { auth_token, ct0 } => cmd_init(&config_path, auth_token, ct0).await,
-            Commands::Register => cmd_register(&config_path).await,
-            Commands::Listen => cmd_listen(&config_path).await,
-            Commands::Status => cmd_status(&config_path).await,
-            Commands::Unregister => cmd_unregister(&config_path).await,
-        }
-    };
+    let result = if let Commands::Listen = cli.command {
+        // `listen` handles Ctrl-C / SIGTERM itself so it can flush the webhook queue.
+        cmd_listen(&config_path).await
+    } else {
+        let task = async {
+            match cli.command {
+                Commands::Init {
+                    auth_token,
+                    ct0,
+                    keep_registration,
+                } => cmd_init(&config_path, auth_token, ct0, keep_registration).await,
+                Commands::Register => cmd_register(&config_path).await,
+                Commands::Listen => unreachable!(),
+                Commands::Status => cmd_status(&config_path).await,
+                Commands::Unregister => cmd_unregister(&config_path).await,
+                Commands::Replay => cmd_replay(&config_path).await,
+            }
+        };
 
-    let result = tokio::select! {
-        result = task => result,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\n{}", style("Interrupted").red().bold());
-            return;
+        tokio::select! {
+            result = task => result,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n{}", style("Interrupted").red().bold());
+                return;
+            }
         }
     };
 
     if let Err(e) = result {
         eprintln!("{} {}", style("error:").red().bold(), e);
         std::process::exit(1);
+    }
+}
+
+/// Resolves on Ctrl-C, or SIGTERM on Unix (docker stop, systemd).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -87,9 +121,14 @@ async fn cmd_init(
     config_path: &PathBuf,
     arg_auth_token: Option<String>,
     arg_ct0: Option<String>,
+    keep_registration: bool,
 ) -> Result<()> {
     eprintln!("{}", style("Initializing configuration").bold());
     eprintln!();
+
+    // An empty env var (e.g. `ANGELIC_CT0=`) counts as not provided.
+    let arg_auth_token = arg_auth_token.filter(|s| !s.is_empty());
+    let arg_ct0 = arg_ct0.filter(|s| !s.is_empty());
 
     let auth_token = match arg_auth_token {
         Some(v) => v,
@@ -101,15 +140,24 @@ async fn cmd_init(
 
     let ct0 = match arg_ct0 {
         Some(v) => v,
-        None => Input::new()
+        None => Password::new()
             .with_prompt("ct0")
-            .interact_text()
+            .interact()
             .map_err(|e| error::AngelicAngelError::Config(format!("input error: {}", e)))?,
     };
 
+    // The Twitter push registration belongs to the old session, so it is dropped by
+    // default; --keep-registration keeps it when only refreshing the same account.
+    let registration = if keep_registration {
+        Config::load(config_path).ok().and_then(|c| c.registration)
+    } else {
+        None
+    };
+    let kept_registration = registration.is_some();
+
     let config = Config {
         twitter: config::TwitterConfig { auth_token, ct0 },
-        registration: None,
+        registration,
     };
 
     config.save(config_path)?;
@@ -118,6 +166,11 @@ async fn cmd_init(
         style("done").green().bold(),
         style(config_path.display()).underlined()
     );
+    if kept_registration {
+        eprintln!("  Existing registration kept.");
+    } else {
+        eprintln!("  Next: run {}", style("angelic-angel register").bold());
+    }
 
     Ok(())
 }
@@ -167,9 +220,11 @@ async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
         )
     })?;
 
+    let webhook_config = webhook::WebhookConfig::from_env(config_path)?;
+
     tracing::info!(config = %config_path.display(), "config loaded, starting listener");
 
-    listener::listen(registration, config_path).await?;
+    listener::listen(registration, config_path, webhook_config, shutdown_signal()).await?;
 
     Ok(())
 }
@@ -182,12 +237,12 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
         Ok(config) => {
             eprintln!("{}  {}", style("Config").cyan().bold(), style(config_path.display()).dim());
             eprintln!(
-                "  auth_token  {}...",
-                style(&config.twitter.auth_token.chars().take(20).collect::<String>()).dim()
+                "  auth_token  {}",
+                style(config::mask_secret(&config.twitter.auth_token)).dim()
             );
             eprintln!(
-                "  ct0         {}...",
-                style(&config.twitter.ct0.chars().take(20).collect::<String>()).dim()
+                "  ct0         {}",
+                style(config::mask_secret(&config.twitter.ct0)).dim()
             );
 
             eprintln!();
@@ -257,5 +312,24 @@ async fn cmd_unregister(config_path: &PathBuf) -> Result<()> {
         style(config_path.display()).underlined()
     );
 
+    Ok(())
+}
+
+async fn cmd_replay(config_path: &PathBuf) -> Result<()> {
+    let webhook_config = webhook::WebhookConfig::from_env(config_path)?;
+    eprintln!(
+        "{} {}",
+        style("Replaying").bold(),
+        style(webhook_config.dead_letter_path.display()).underlined()
+    );
+
+    let (sent, failed) = spin(
+        "Sending to webhook...",
+        "Replay finished",
+        webhook::replay(&webhook_config),
+    )
+    .await?;
+
+    eprintln!("  sent {}, still failing {}", sent, failed);
     Ok(())
 }

@@ -39,7 +39,7 @@ pub fn generate_keys() -> WebPushKeys {
 pub async fn subscribe() -> Result<PushSubscription> {
     let keys = generate_keys();
 
-    let registration = autopush::register_new(&keys)
+    let registration = autopush::register_new()
         .await
         .map_err(|e| AngelicAngelError::AutoPush(format!("AutoPush registration failed: {}", e)))?;
 
